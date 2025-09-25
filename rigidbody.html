@@ -8,14 +8,16 @@
     <body>
         <canvas width="512" height="512"></canvas>
         <script type="module">
-            const MAX_SHAPES = 5;
-            const SHAPE_MEMBERS = 5;
+            const MAX_SHAPES = 8;
+            const SHAPE_MEMBERS = 9;
             const SHAPE_SIZE = 0.05;
             
             const UPDATE_INTERVAL = 1000/60;
+            const COLLISIONS = MAX_SHAPES*(MAX_SHAPES - 1)/2;
+
             let step = 0;
 
-            const WORKGROUP_SIZE = 8;
+            const TILE_SIZE = 2
 
             const canvas = document.querySelector("canvas");
             if (!navigator.gpu) {
@@ -38,7 +40,7 @@
                 size: 32,
                 usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
             });
-            updateUniforms(SHAPE_MEMBERS, SHAPE_SIZE, UPDATE_INTERVAL);
+            updateUniforms(SHAPE_MEMBERS, SHAPE_SIZE, UPDATE_INTERVAL, MAX_SHAPES);
 
             //format is flattened array of [[posx, posy], [velx, vely], rot]
             const shapeStateArray = new Float32Array(MAX_SHAPES * SHAPE_MEMBERS);
@@ -56,12 +58,34 @@
                 })
             ];
 
+            const colTimes = device.createBuffer({
+                label: "Collision times",
+                size: COLLISIONS*4,
+                usage: GPUBufferUsage.STORAGE,
+            });
+
+            const nextTimeIndexStorage = device.createBuffer({
+                label: "Next time index value",
+                size: 4,
+                usage: GPUBufferUsage.STORAGE,
+            });
+
+            const remainingTimeStorage = device.createBuffer({
+                label: "Remaining time value",
+                size: 4,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            })
+
             for (let i = 0; i < MAX_SHAPES; ++i) {
-                shapeStateArray[i*SHAPE_MEMBERS + 0] = -0.8 + i*(SHAPE_SIZE*2.3); //pox
-                shapeStateArray[i*SHAPE_MEMBERS + 1] = 0; //posy
-                shapeStateArray[i*SHAPE_MEMBERS + 2] = 0; //velx
-                shapeStateArray[i*SHAPE_MEMBERS + 3] = 0; //vely
-                shapeStateArray[i*SHAPE_MEMBERS + 4] = 1; //rot
+                shapeStateArray[i*SHAPE_MEMBERS + 0] = -0.8 + i*(SHAPE_SIZE*4.3); //posx
+                shapeStateArray[i*SHAPE_MEMBERS + 1] = i*0.05; //posy
+                shapeStateArray[i*SHAPE_MEMBERS + 2] = -Math.pow(i, 2)*0.0001; //velx
+                shapeStateArray[i*SHAPE_MEMBERS + 3] = -Math.pow(i, 2)*0.00002; //vely
+                shapeStateArray[i*SHAPE_MEMBERS + 4] = 0; //rotational vel
+                shapeStateArray[i*SHAPE_MEMBERS + 5] = 0; //rot
+                shapeStateArray[i*SHAPE_MEMBERS + 6] = 0.9; //r
+                shapeStateArray[i*SHAPE_MEMBERS + 7] = 0.9; //g
+                shapeStateArray[i*SHAPE_MEMBERS + 8] = 0.9; //b
             }
             device.queue.writeBuffer(shapeStateStorage[0], 0, shapeStateArray);
 
@@ -105,6 +129,7 @@
 
                     struct VertexOutput {
                         @builtin(position) pos: vec4f,
+                        @location(0) @interpolate(flat) instance: u32,
                     };
 
                     struct Uniforms {
@@ -113,9 +138,9 @@
                         updateInterval: f32,
                     };
 
-                    fn rotate(pos: vec2f, theta: f32) -> vec2f {
-                        let rotMat = mat2x2f( vec2f(cos(theta), sin(theta)),
-                                            vec2f(-sin(theta), cos(theta)));
+                    fn rotate(pos: vec2f, angle: f32) -> vec2f {
+                        let rotMat = mat2x2f( vec2f(cos(angle), sin(angle)),
+                                            vec2f(-sin(angle), cos(angle)));
                         let result = rotMat * pos;
                         return result;
                     }
@@ -130,19 +155,24 @@
                         let shapeIndex = i*shapeMembers;
 
                         let shapePos = vec2f(shapeState[shapeIndex + 0], shapeState[shapeIndex + 1]);
-                        let shapeRot = shapeState[shapeIndex + 4];
+                        let shapeAngle = shapeState[shapeIndex + 5];
 
                         let scaledPos = input.pos*uniforms.shapeSize;
-                        let newPos = rotate(scaledPos, shapeRot) + shapePos;
+                        let newPos = rotate(scaledPos, shapeAngle) + shapePos;
 
                         var output: VertexOutput;
                         output.pos = vec4f(newPos, 0, 1);
+                        output.instance = input.instance;
                         return output;
                     }
                     
                     @fragment
                     fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
-                        return vec4f(1, 1, 1, 1);
+                        let i = u32(input.instance);
+                        let shapeMembers = u32(uniforms.shapeMembers);
+                        let shapeIndex = i*shapeMembers;
+
+                        return vec4f(shapeState[shapeIndex + 6], shapeState[shapeIndex + 7], shapeState[shapeIndex + 8], 1);
                     }
                 `
             })
@@ -150,64 +180,320 @@
             const simulationShaderModule = device.createShaderModule({
                 label: "Game of Life simulation shader",
                 code: `
+                    @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+                    @group(0) @binding(1) var<storage> shapeStateA: array<f32>;
+                    @group(0) @binding(2) var<storage, read_write> shapeStateB: array<f32>;
+                    @group(0) @binding(3) var<storage, read_write> collisionTimes: array<f32, ${COLLISIONS}>;
+                    @group(0) @binding(4) var<storage, read_write> nextTimeIndex: u32;
+                    @group(0) @binding(5) var<storage, read_write> remainingTime: f32;
+
+
+                    const T: u32 = ${TILE_SIZE};
+                    const A: u32 = 0;
+                    const B: u32 = 1;
+
                     struct Uniforms {
                         shapeMembers: f32,
                         shapeSize: f32,
                         updateInterval: f32,
+                        maxShapes: f32,
                     };
 
                     struct Shape {
                         pos : vec2f,
-                        vel : vec2f,
-                        rot : f32,
+                        v : vec2f,
+                        w : f32,
+                        angle : f32,
+                        color : vec3f,
                     };
 
-                    @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-                    @group(0) @binding(1) var<storage> shapeStateIn: array<f32>;
-                    @group(0) @binding(2) var<storage, read_write> shapeStateOut: array<f32>;
+                    fn readShape(arr: ptr<storage, array<f32>>, shapeIndex: u32) -> Shape {
+
+                        let realIndex = u32(uniforms.shapeMembers)*shapeIndex;
+
+                        var shapeIn: Shape;
+                        shapeIn.pos = vec2f((*arr)[realIndex + 0], (*arr)[realIndex + 1]);
+                        shapeIn.v = vec2f((*arr)[realIndex + 2], (*arr)[realIndex + 3]);
+                        shapeIn.w = (*arr)[realIndex + 4];
+                        shapeIn.angle = (*arr)[realIndex + 5];
+                        shapeIn.color.r = (*arr)[realIndex + 6];
+                        shapeIn.color.g = (*arr)[realIndex + 7];
+                        shapeIn.color.b = (*arr)[realIndex + 8];
+                        return shapeIn;
+                    }
                     
-                    fn writeShapeOut(shapeIndex: u32, shape: Shape) {
-                        shapeStateOut[shapeIndex + 0] = shape.pos.x;
-                        shapeStateOut[shapeIndex + 1] = shape.pos.y;
-                        shapeStateOut[shapeIndex + 2] = shape.vel.x;
-                        shapeStateOut[shapeIndex + 3] = shape.vel.y;
-                        shapeStateOut[shapeIndex + 4] = shape.rot;
+                    fn writeShape(arr: ptr<storage, array<f32>, read_write>, shapeIndex: u32, shape: Shape) {
+                    
+                        let realIndex = u32(uniforms.shapeMembers)*shapeIndex;
+
+                        (*arr)[realIndex + 0] = shape.pos.x;
+                        (*arr)[realIndex + 1] = shape.pos.y;
+                        (*arr)[realIndex + 2] = shape.v.x;
+                        (*arr)[realIndex + 3] = shape.v.y;
+                        (*arr)[realIndex + 4] = shape.w;
+                        (*arr)[realIndex + 5] = shape.angle;
+                        (*arr)[realIndex + 6] = shape.color.r;
+                        (*arr)[realIndex + 7] = shape.color.g;
+                        (*arr)[realIndex + 8] = shape.color.b;
+                    }
+                    
+                    fn rotate(pos: vec2f, angle: f32) -> vec2f {
+                        let rotMat = mat2x2f( vec2f(cos(angle), sin(angle)),
+                                            vec2f(-sin(angle), cos(angle)));
+                        let result = rotMat * pos;
+                        return result;
+                    }
+                    
+                    fn projVec(u: vec2f, v: vec2f) -> vec2f {
+                        //project u on to v
+                        return dot(u, v)/pow(length(v), 2)*v;
+                    }
+
+                    fn projVecScal(u: vec2f, v: vec2f) -> f32 {
+                        //length of u projected on to v
+                        return dot(u, v)/length(v);
+                    }
+
+                    fn getPoints(shape: Shape) -> array<vec2f, 4> {
+                        var points = array<vec2f, 4>(vec2f(-1, -1), vec2f(-1, 1), vec2f(1, 1), vec2f(1, -1));    
+                        
+                        for(var i: u32 = 0; i < 4u; i = i + 1u) {
+                            let p = points[i];
+                            let scaledPos = p*uniforms.shapeSize;
+                            let newPos = rotate(scaledPos, shape.angle) + shape.pos;
+                            points[i] = newPos;
+                        }
+                        
+                        return points;
+                    }
+
+                    fn testCollision(shape1: Shape, shape2: Shape) -> bool {
+                        //get shape points
+                        let points1: array<vec2f, 4> = getPoints(shape1);
+                        let points2: array<vec2f, 4> = getPoints(shape2);
+
+                        for(var s: u32 = 0; s < 2u; s = s + 1u) {
+                            for(var i: u32 = 0; i < 4u; i = i + 1u) {
+                                var v: vec2f;
+                                if(s == 0) {
+                                    v = points1[i] - points1[(i + 1) % 4];
+                                } else {
+                                    v = points2[i] - points2[(i + 1) % 4];
+                                }
+
+                                var p1Min: f32 = 100000;
+                                var p1Max: f32 = -100000;
+                                var p2Min: f32 = 100000;
+                                var p2Max: f32 = -100000;
+
+                                for(var j: u32 = 0; j < 4u; j = j + 1u) {
+                                    let u = points1[j];
+                                    let val = projVecScal(u, v);
+                                    if(val < p1Min) {
+                                        p1Min = val;
+                                    }
+                                    if(val > p1Max) {
+                                        p1Max = val;
+                                    }
+                                }
+                                for(var j: u32 = 0; j < 4u; j = j + 1u) {
+                                    let u = points2[j];
+                                    let val = projVecScal(u, v);
+                                    if(val < p2Min) {
+                                        p2Min = val;
+                                    }
+                                    if(val > p2Max) {
+                                        p2Max = val;
+                                    }
+                                }
+
+                                if(p1Min > p2Max ||
+                                    p2Min > p1Max) {
+                                    return false;
+                                }
+                            }
+                        }
+                        return true;
+                    }
+                    
+                    fn cTime(shape1: Shape, shape2: Shape) -> f32 {
+                        // let diff: vec2f = shape1.pos - shape2.pos;
+                        // let distance: f32 = sqrt(dot(diff, diff));
+                        // return 1000;
+
+
+                        //use taxi cab distance to predict x and y beign in bounds
+                        let m: f32 = uniforms.shapeSize*2;
+                        var xUpper: f32 = (m + shape1.pos.x - shape2.pos.x)/(shape2.v.x - shape1.v.x);
+                        var xLower: f32 = (-m + shape1.pos.x - shape2.pos.x)/(shape2.v.x - shape1.v.x);
+                        var yUpper: f32 = (m + shape1.pos.y - shape2.pos.y)/(shape2.v.y - shape1.v.y);
+                        var yLower: f32 = (-m + shape1.pos.y - shape2.pos.y)/(shape2.v.y - shape1.v.y);
+
+                        if(xUpper < xLower) {
+                            let temp = xUpper;
+                            xUpper = xLower;
+                            xLower = temp;
+                        }
+
+                        if(yUpper < yLower) {
+                            let temp = yUpper;
+                            yUpper = yLower;
+                            yLower = temp;
+                        }
+
+                        if(xLower < yUpper && xLower > yLower && xLower > 0) {
+                            return xLower;
+                        } else if(yLower < xUpper && yLower > xLower && yLower > 0) {
+                            return yLower;
+                        }
+                        return 1000;
                     }
 
                     fn collideBottom(shape: ptr<function, Shape>) {
                         let difference = 1.0 - ((*shape).pos.y - uniforms.shapeSize);
                         if((*shape).pos.y - uniforms.shapeSize <= -1.0) {
-                            shape.vel.y = -shape.vel.y;
+                            shape.v.y = -shape.v.y;
                         }
                     }
 
+                    fn xyToCIndex(x: u32, y: u32) -> u32 {
+                        return y*(y-1)/2 + x;
+                    }
+ 
+                    fn cIndexToXY(i: u32) -> vec2u {
+                        let y: u32 = u32(floor((sqrt(f32(1+8*i))+1)/2));
+                        let x: u32 = i - (y*(y-1))/2;
+                        return vec2u(x,y);
+                    }
+
+                    fn updateShape(shape: ptr<function, Shape>, time: f32) {
+                        (*shape).pos.x += shape.v.x * time;
+                        (*shape).pos.y += shape.v.y * time;
+                        (*shape).angle += shape.w * time;
+                        // (*shape).color = vec3f(1.0, 1.0, 1.0);
+                    }
+
+                    fn collideShapes(shapeA: ptr<function, Shape>, shapeB: ptr<function, Shape>) {
+                        (*shapeA).color.g *= 0.9;
+                        (*shapeA).color.b *= 0.9;
+                        (*shapeB).color.g *= 0.9;
+                        (*shapeB).color.b *= 0.9;
+
+
+                        let xDiff: f32 = (*shapeA).pos.x - (*shapeB).pos.x;
+                        let yDiff: f32 = (*shapeA).pos.y - (*shapeB).pos.y;
+
+                        if(abs(xDiff) > abs(yDiff)) {
+                            let temp: f32 = (*shapeA).v.x;
+                            (*shapeA).v.x = (*shapeB).v.x;
+                            (*shapeB).v.x = temp;
+                        } else {
+                            let temp: f32 = (*shapeA).v.y;
+                            (*shapeA).v.y = (*shapeB).v.y;
+                            (*shapeB).v.y = temp;
+                        }
+                    }
+
+                    var<workgroup> tileA: array<Shape, T>;
+                    var<workgroup> tileB: array<Shape, T>;
+
                     @compute
-                    @workgroup_size(${WORKGROUP_SIZE})
-                    fn computeMain(@builtin(global_invocation_id) cell: vec3u) {
-                        let i = cell.x;
-                        let shapeMembers = u32(uniforms.shapeMembers);
-                        let shapeIndex = i*shapeMembers;
-                        let updateInterval = uniforms.updateInterval;
+                    @workgroup_size(T, T)
+                    fn computeCTimes(@builtin(workgroup_id) wg: vec3u,
+                                   @builtin(local_invocation_id) lid: vec3<u32>) {
 
-                        var shapeIn: Shape;
-                        shapeIn.pos = vec2f(shapeStateIn[shapeIndex + 0], shapeStateIn[shapeIndex + 1]);
-                        shapeIn.vel = vec2f(shapeStateIn[shapeIndex + 2], shapeStateIn[shapeIndex + 3]);
-                        shapeIn.rot = shapeStateIn[shapeIndex + 4];
+                        var noOp = false;
+                        if(remainingTime <= 0) {
+                            noOp = true;
+                        }
 
-                        var shapeOut: Shape;
-                        shapeOut.pos = shapeIn.pos + shapeIn.vel*(updateInterval/1000);
+                        let bi = wg.x * T;
+                        let bj = wg.y * T;
+                        let gx = bi + lid.x;
+                        let gy = bj + lid.y;
 
-                        //calculate acceleration
-                        var acc = vec2(0, -4.9); //gravity
+                        if(wg.x > wg.y || 
+                            (wg.x == wg.y && lid.x >= lid.y) ||
+                            noOp) {
+                            //nothing
+                        } else {
+                            //copy global data to workgroup tiles
+                            tileA[lid.x] = readShape(&shapeStateA, gx);
+                            tileB[lid.y] = readShape(&shapeStateA, gy);
+
+                            let time: f32 = cTime(tileA[lid.x], tileB[lid.y]);
+                            let cTimeIndex = xyToCIndex(gx, gy);
+                            collisionTimes[cTimeIndex] = time;
+                        }
                         
-                        shapeOut.vel = shapeIn.vel + acc*(updateInterval/1000);
-
-                        collideBottom(&shapeOut);
-
-                        shapeOut.rot = shapeIn.rot + 0.1;
-
+                        workgroupBarrier();
                         
-                        writeShapeOut(shapeIndex, shapeOut);
+                        //only one thread finds smallest collision time
+                        if(gx == 0 && gy == 0 && !noOp) {
+                            var shortestIndex: u32 = 0;
+                            var shortestTime = collisionTimes[0];
+                            for(var i: u32 = 1; i < ${COLLISIONS}; i = i + 1u) {
+                                let time: f32 = collisionTimes[i];
+                                if(time < shortestTime) {
+                                    shortestIndex = i;
+                                    shortestTime = time;
+                                }
+                            }
+                            nextTimeIndex = shortestIndex;
+                        }
+                        
+                    }
+
+                    @compute
+                    @workgroup_size(T)
+                    fn computeStep(@builtin(workgroup_id) wg: vec3u,
+                                   @builtin(local_invocation_id) lid: vec3<u32>) {
+                        
+                        let nextTimeIndex_ = nextTimeIndex;
+                        let remainingTime_ = remainingTime;
+                        let gx = wg.x * T + lid.x;
+
+                        workgroupBarrier();
+
+                        if(remainingTime_ == 0) {
+                            var shape: Shape = readShape(&shapeStateA, gx);
+                            writeShape(&shapeStateB, gx, shape);
+                            if(gx == 0) {
+                                remainingTime = -1;
+                            }
+                            return;
+                        } else if(remainingTime_ == -1) {
+                            return;
+                        }
+                        
+                        var nextTime: f32 = collisionTimes[nextTimeIndex_];
+                        var doCollision: bool = true;
+                        if(nextTime > remainingTime_) {
+                            nextTime = remainingTime_;
+                            doCollision = false;
+                        }
+
+                        var shape: Shape = readShape(&shapeStateA, gx);
+                        updateShape(&shape, nextTime);
+                        
+                        let cIndexXY: vec2u = cIndexToXY(nextTimeIndex_);
+                        if(doCollision) {
+                            if(cIndexXY.x == gx) {
+                                var shapeCollided: Shape = readShape(&shapeStateA, cIndexXY.y);
+                                updateShape(&shapeCollided, nextTime);
+
+                                collideShapes(&shape, &shapeCollided);
+                                writeShape(&shapeStateB, cIndexXY.y, shapeCollided);
+                            } else if(cIndexXY.y == gx) {
+                                return;
+                            }
+                        }
+                        writeShape(&shapeStateB, gx, shape);
+
+                        if(gx == 0) {
+                            remainingTime = remainingTime_ - nextTime;
+                        }
+
                     }
                     `
             });
@@ -221,13 +507,26 @@
                     buffer: {}
                 }, {
                     binding: 1,
-                    visibility: GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE,
+                    visibility: GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE | GPUShaderStage.FRAGMENT,
                     buffer: { type: "read-only-storage"}
                 }, {
                     binding: 2,
                     visibility: GPUShaderStage.COMPUTE,
                     buffer: { type: "storage" }
+                }, {
+                    binding: 3,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: "storage" }
+                }, {
+                    binding: 4,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: "storage" }
+                }, {
+                    binding: 5,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: "storage" }
                 }]
+                
             });
 
             const bindGroups = [
@@ -246,6 +545,18 @@
                     {
                         binding: 2,
                         resource: { buffer: shapeStateStorage[1] }
+                    },
+                    {
+                        binding: 3,
+                        resource: { buffer: colTimes }
+                    },
+                    {
+                        binding: 4,
+                        resource: { buffer: nextTimeIndexStorage }
+                    },
+                    {
+                        binding: 5,
+                        resource: { buffer: remainingTimeStorage }
                     }
                     ],
                 }),
@@ -264,6 +575,18 @@
                     {
                         binding: 2,
                         resource: { buffer: shapeStateStorage[0] }
+                    },
+                    {
+                        binding: 3,
+                        resource: { buffer: colTimes }
+                    },
+                    {
+                        binding: 4,
+                        resource: { buffer: nextTimeIndexStorage }
+                    },
+                    {
+                        binding: 5,
+                        resource: { buffer: remainingTimeStorage }
                     }
                     ],
                 })
@@ -291,36 +614,56 @@
                 }
             });
 
-            const simulationPipeline = device.createComputePipeline({
-                label: "Simulation pipeline",
+            const simulationPipelineCTimes = device.createComputePipeline({
+                label: "Simulation pipeline for collision times",
                 layout: pipelineLayout,
                 compute: {
                     module: simulationShaderModule,
-                    entryPoint: "computeMain",
+                    entryPoint: "computeCTimes",
                 }
             });
 
-            function updateUniforms(shapeMembers, shapeSize, updateInterval) {
+            const simulationPipelinePStep = device.createComputePipeline({
+                label: "Simulation pipeline for physics step",
+                layout: pipelineLayout,
+                compute: {
+                    module: simulationShaderModule,
+                    entryPoint: "computeStep",
+                }
+            });
+
+            function updateUniforms(shapeMembers, shapeSize, updateInterval, maxShapes) {
                 const uniformArray = new Float32Array([
                     shapeMembers,
                     shapeSize,
-                    updateInterval, 0
+                    updateInterval,
+                    maxShapes,
                 ]);
 
                 device.queue.writeBuffer(uniformBuffer, 0, uniformArray);
             }
 
             function updateGrid() {
+                //begin compute pass
+
+                device.queue.writeBuffer(remainingTimeStorage, 0, new Float32Array([UPDATE_INTERVAL]));
+
                 const encoder = device.createCommandEncoder();
 
                 const computePass = encoder.beginComputePass();
 
-                computePass.setPipeline(simulationPipeline);
-                computePass.setBindGroup(0, bindGroups[step % 2]);
+                const TILE_COUNT_DIM = MAX_SHAPES / TILE_SIZE;
 
-                const workgroupCount = Math.ceil(MAX_SHAPES / WORKGROUP_SIZE);
-                computePass.dispatchWorkgroups(workgroupCount);
+                for(let i = 0; i < 8; i++) {
+                    computePass.setBindGroup(0, bindGroups[i % 2]);
 
+                    computePass.setPipeline(simulationPipelineCTimes);
+                    computePass.dispatchWorkgroups(TILE_COUNT_DIM, TILE_COUNT_DIM);
+
+                    computePass.setPipeline(simulationPipelinePStep);
+                    computePass.dispatchWorkgroups(TILE_COUNT_DIM);
+                }
+                
                 computePass.end();
 
                 step++;
@@ -339,7 +682,7 @@
                 pass.setPipeline(cellPipeline);
                 pass.setVertexBuffer(0, vertexBuffer);
 
-                pass.setBindGroup(0, bindGroups[step % 2]);
+                pass.setBindGroup(0, bindGroups[0]);
 
                 pass.draw(vertices.length / 2, MAX_SHAPES);
 
