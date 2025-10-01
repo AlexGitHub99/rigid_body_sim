@@ -9,17 +9,22 @@
         <canvas width="512" height="512"></canvas>
         <script type="module">
             const MAX_SHAPES = 100;
-            const SHAPE_MEMBERS = 9;
-            const SHAPE_SIZE = 0.05;
-            const CANVAS_SIZE = 1.0;
-            
-            const UPDATE_INTERVAL = 1000/60;
+            const TILE_SIZE = 2;
             const SHAPE_COLLISIONS = MAX_SHAPES*(MAX_SHAPES - 1)/2;
             const COLLISIONS = SHAPE_COLLISIONS + MAX_SHAPES*4;
 
-            let step = 0;
+            const SHAPE_MEMBERS = 9;
+            const SHAPE_SIZE = 0.05;
 
-            const TILE_SIZE = 2;
+            const CANVAS_SIZE = 1.0;
+            
+            const UPDATE_INTERVAL = 1000/60;
+           
+            const DO_FRAME_SYNCH = true;
+
+            let step = 0;
+            let frameElapsedTime = 0;
+
 
             const canvas = document.querySelector("canvas");
             if (!navigator.gpu) {
@@ -730,6 +735,8 @@
 
                 device.queue.writeBuffer(remainingTimeStorage, 0, new Float32Array([UPDATE_INTERVAL]));
 
+                const start = performance.now();
+
                 const encoder = device.createCommandEncoder();
 
                 const computePass = encoder.beginComputePass();
@@ -771,9 +778,18 @@
                 pass.end();
                 const commandBuffer = encoder.finish();
                 device.queue.submit([commandBuffer]);
+
+                if(DO_FRAME_SYNCH) {
+                    device.queue.onSubmittedWorkDone().then(() => {
+                        frameElapsedTime = performance.now() - start;
+                    });
+                }
+                setTimeout(() => {
+                    updateGrid();
+                }, UPDATE_INTERVAL - frameElapsedTime);
             }
 
-            setInterval(updateGrid, UPDATE_INTERVAL);
+            updateGrid();
             
         </script>
     </body>
